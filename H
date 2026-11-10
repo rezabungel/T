@@ -1,0 +1,108 @@
+
+import json
+import base64
+from pathlib import Path
+
+from kafka import KafkaConsumer, TopicPartition
+
+
+BOOTSTRAP_SERVERS = ["kafka-server:9093"]
+TOPIC = "my-topic"
+TRUSTSTORE = "truststore.pem"
+
+OUTPUT_DIR = Path("messages")
+
+
+def decode_value(value):
+    if value is None:
+        return None
+
+    try:
+        return value.decode("utf-8")
+    except UnicodeDecodeError:
+        return {
+            "encoding": "base64",
+            "data": base64.b64encode(value).decode("ascii")
+        }
+
+
+def save_message(message):
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    filename = (
+        f"partition_{message.partition}_"
+        f"offset_{message.offset}.json"
+    )
+
+    data = {
+        "topic": message.topic,
+        "partition": message.partition,
+        "offset": message.offset,
+        "timestamp": message.timestamp,
+        "key": decode_value(message.key),
+        "value": decode_value(message.value)
+    }
+
+    path = OUTPUT_DIR / filename
+
+    with path.open("w", encoding="utf-8") as file:
+        json.dump(data, file, ensure_ascii=False, indent=4)
+
+    print(f"Saved: {path}")
+
+
+consumer = KafkaConsumer(
+    bootstrap_servers=BOOTSTRAP_SERVERS,
+    security_protocol="SSL",
+    ssl_cafile=TRUSTSTORE,
+    enable_auto_commit=False
+)
+
+try:
+    partitions = consumer.partitions_for_topic(TOPIC)
+
+    if not partitions:
+        raise RuntimeError(f"Topic not found: {TOPIC}")
+
+    topic_partitions = [
+        TopicPartition(TOPIC, p)
+        for p in partitions
+    ]
+
+    consumer.assign(topic_partitions)
+
+    # Запоминаем конечные offsets
+    end_offsets = consumer.end_offsets(topic_partitions)
+
+    # Получаем начало доступных сообщений
+    beginning_offsets = consumer.beginning_offsets(topic_partitions)
+
+    # Переходим к началу каждой партиции
+    for tp in topic_partitions:
+        consumer.seek(tp, beginning_offsets[tp])
+
+    print(f"Topic: {TOPIC}")
+    print(f"Partitions: {len(topic_partitions)}")
+    print(f"Target offsets: {end_offsets}")
+
+    saved = 0
+
+    while True:
+        records = consumer.poll(timeout_ms=1000)
+
+        for messages in records.values():
+            for message in messages:
+                save_message(message)
+                saved += 1
+
+        # Проверяем, достигнуты ли конечные offsets
+        if all(
+            consumer.position(tp) >= end_offsets[tp]
+            for tp in topic_partitions
+        ):
+            break
+
+    print(f"Finished. Saved messages: {saved}")
+
+finally:
+    consumer.close()
